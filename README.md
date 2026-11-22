@@ -1,1 +1,1 @@
-# VLM-GPRO-Bbox
+# VLM-GPRO-BBox
