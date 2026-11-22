@@ -64,7 +64,8 @@ def main():
         strict.append(ok)
         trunc.append(o.outputs[0].finish_reason == "length")
         ntok.append(len(o.outputs[0].token_ids))
-        preds.append({"image": r["image"], "pred": pred, "thinking": thinking, "raw": text})
+        preds.append({"id": r["image"], "image": r["image"], "score": soft[-1], "n_pred": len(pred),
+                      "n_gt": len(r["objects"]), "thinking": thinking, "pred": pred, "completion": text})
 
     metrics = {}
     print(f"\n{args.model}" + (f" + {args.adapter}" if args.adapter else "") + f"  [{args.split}, {len(rows)} images]")

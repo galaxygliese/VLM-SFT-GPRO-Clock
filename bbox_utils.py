@@ -244,3 +244,16 @@ def thinking_format_reward(completions, log_metric=None, **kwargs):
         log_metric("think/well_formed", float(np.mean(oks)))
         log_metric("think/chars", float(np.mean(lens)))
     return rewards
+
+
+def probe_score(text, probe):
+    """For grpo_common.ThinkingProbeCallback: probe = {"image_path", "id", "objects" (0-1000 GT)}."""
+    thinking, answer, ok = split_thinking(text)
+    pred, strict = parse_objects(answer)
+    st = match(pred, probe["objects"])
+    tp = sum(v[0] for v in st.values())
+    p, r, f = prf(tp, len(pred), len(probe["objects"]))
+    return {"score": detection_score(pred, probe["objects"]), "P": p, "R": r, "F1": f,
+            "n_pred": len(pred), "n_gt": len(probe["objects"]), "strict_json": strict,
+            "thinking": thinking, "think_ok": ok,
+            "answer": f"{len(pred)} boxes: " + ", ".join(f"{k}={sum(o['label'] == k for o in pred)}" for k in CLASSES)}

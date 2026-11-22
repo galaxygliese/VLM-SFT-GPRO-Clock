@@ -9,6 +9,10 @@ Rewards (bbox_utils.py):
   - format_reward:          clean JSON list with valid labels and boxes in [0, 1000]
   - thinking_format_reward: (thinking mode) one non-empty leading <thinking> block, soft length cap
 
+Thinking progress: the first --n_probe eval images are answered greedily at step 0 and at every save
+-> <ckpt>/thinking_probe.jsonl, <output_dir>/thinking_probes.jsonl, wandb "thinking_probe" table.
+Compare checkpoints: python tools/show_thinking.py outputs/grpo-bbox-think
+
 Policy: LoRA on the language model. Rollouts: vLLM colocated on the same GPU, sleeping during the
 backward pass. Every GRPOConfig field can be overridden on the command line:
 
@@ -29,7 +33,8 @@ from transformers import HfArgumentParser
 from trl import GRPOConfig, GRPOTrainer
 
 from bbox_utils import (CLASSES, answer_text, completion_text, detection_reward, format_reward, get_prompt,
-                        load_split, parse_objects, split_thinking, thinking_format_reward)
+                        load_split, parse_objects, probe_score, split_thinking, thinking_format_reward)
+from grpo_common import ThinkingProbeCallback, patch_vllm_image_placeholders
 
 
 @dataclass
@@ -46,6 +51,9 @@ class ScriptArgs:
     detection_weight: float = 1.0
     wandb_project: str = "vlm-grpo-bbox"
     log_samples_every: int = field(default=10, metadata={"help": "wandb box-overlay samples every N steps (0=off)"})
+    n_probe: int = field(default=4, metadata={"help": "fixed eval images answered greedily at step 0 and every "
+                                                      "save to track the thinking (0=off)"})
+    probe_max_new_tokens: int = 3072
 
 
 # Defaults; anything passed on the command line comes later and wins.
@@ -155,35 +163,6 @@ def _log_samples(wandb, step, completions, objects, images, rewards, n_show):
     wandb.log({"samples": table}, commit=False)
 
 
-def patch_vllm_image_placeholders(trainer):
-    """Work around double image expansion (TRL 1.17 + vLLM 0.32 + Qwen3-VL).
-
-    TRL sends prompt_token_ids that the HF processor already expanded (1 image -> 1156
-    <|image_pad|> tokens). vLLM does not detect the expansion and inserts the image tokens a
-    second time, which roughly doubles the prompt and misaligns the vision features. Collapsing
-    each run of <|image_pad|> to a single token makes vLLM rebuild exactly the HF token sequence.
-    TRL only uses the completion ids that vLLM returns, so training inputs are unaffected.
-    """
-    vg = getattr(trainer, "vllm_generation", None)
-    if vg is None or getattr(vg, "llm", None) is None:
-        return
-    tok = trainer.processing_class.tokenizer
-    pad_ids = {tok.convert_tokens_to_ids(t) for t in ("<|image_pad|>", "<|video_pad|>")}
-    llm, orig_generate = vg.llm, vg.llm.generate
-
-    def generate(prompts, *args, **kwargs):
-        fixed = []
-        for p in prompts:
-            if isinstance(p, dict) and "prompt_token_ids" in p and "multi_modal_data" in p:
-                ids = p["prompt_token_ids"]
-                ids = [t for i, t in enumerate(ids) if not (t in pad_ids and i > 0 and ids[i - 1] == t)]
-                p = {**p, "prompt_token_ids": ids}
-            fixed.append(p)
-        return orig_generate(fixed, *args, **kwargs)
-
-    llm.generate = generate
-
-
 def main():
     parser = HfArgumentParser((ScriptArgs, GRPOConfig))
     script_args, cfg = parser.parse_args_into_dataclasses(args=DEFAULTS + sys.argv[1:])
@@ -221,6 +200,12 @@ def main():
         peft_config=peft_config,
     )
     patch_vllm_image_placeholders(trainer)
+    if script_args.n_probe:
+        root = script_args.data_root
+        probes = [{**r, "image_path": os.path.join(root, r["image"]), "id": r["image"]}
+                  for r in load_split(f"{root}/labels/eval.jsonl", CLASSES)[:script_args.n_probe]]
+        ThinkingProbeCallback(trainer.processing_class, probes, prompt, probe_score,
+                              max_new_tokens=script_args.probe_max_new_tokens, batch_size=4).attach(trainer)
     if trainer.accelerator.is_main_process and "wandb" in (cfg.report_to or []):
         import wandb
         if wandb.run is not None:
