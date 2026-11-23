@@ -23,7 +23,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from clock_utils import get_prompt, load_split, parse_time, split_thinking, time_score  # noqa: E402
+from utils.clock_utils import get_prompt, load_split, parse_time, split_thinking, time_score  # noqa: E402
 
 
 def score(rows, outs, step):

@@ -3,7 +3,12 @@
 The model reasons inside <thinking></thinking> (find the hands, what each points at, cross-check
 hour-hand position vs minutes) and then answers HH:MM. Only the answer after </thinking> is scored.
 
-Rewards (clock_utils.py):
+Rewards (utils/clock_utils.py), chosen with --reward:
+  robust (default):
+  - time_reward (1.0):        robust_time_score(dial error): continuous, Cauchy core (scale 12 min) + linear tail
+  - consistency_reward (0.5): "The time is H:MM" at the end of the thinking equals the answer
+  - format_reward (0.25):     answer is exactly HH:MM
+  linear (the earlier runs):
   - time_reward (1.0):            1 within 1 min on the 12h dial, linear to 0 at 30 min off
   - format_reward (0.25):         answer is exactly HH:MM
   - thinking_format_reward (0.25): one non-empty leading <thinking> block (soft length cap)
@@ -29,8 +34,9 @@ from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, HfArgumentParser
 from trl import GRPOConfig, GRPOTrainer
 
-from utils.clock_utils import (format_reward, get_prompt, load_split, probe_score, split_thinking,
-                         thinking_format_reward, time_reward, time_score)
+from utils.clock_utils import (consistency_reward, format_reward, get_prompt, load_split, probe_score,
+                               robust_time_reward, split_thinking, thinking_format_reward, time_reward,
+                               time_score)
 from grpo_common import ThinkingProbeCallback, patch_vllm_image_placeholders
 
 
@@ -47,7 +53,9 @@ class ScriptArgs:
     lora_r: int = 64
     lora_alpha: int = 128
     lora_dropout: float = 0.05
+    reward: str = field(default="robust", metadata={"help": "robust (continuous time + consistency) or linear (old)"})
     time_weight: float = 1.0
+    consistency_weight: float = 0.5
     format_weight: float = 0.25
     think_weight: float = 0.25
     n_probe: int = field(default=8, metadata={"help": "fixed eval images for the thinking probe (0=off)"})
@@ -110,12 +118,12 @@ def build_dataset(rows, prompt):
     )
 
 
-def make_time_reward(every, n_show=8):
+def make_time_reward(every, n_show=8, base=time_reward):
     """time_reward + every `every` steps a wandb table of rollouts (image, gt, thinking, answer, reward)."""
     last = {"step": -1}
 
     def time_reward_logged(completions, hour, minute, time=None, image=None, trainer_state=None, **kwargs):
-        rewards = time_reward(completions, hour, minute, **kwargs)
+        rewards = base(completions, hour, minute, **kwargs)
         step = trainer_state.global_step if trainer_state is not None else 0
         if every and image is not None and step % every == 0 and step != last["step"]:
             last["step"] = step
@@ -150,11 +158,18 @@ def main():
     os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
     prompt = get_prompt(script_args.thinking)
-    reward_funcs = [make_time_reward(script_args.log_samples_every), format_reward]
+    if script_args.reward not in ("robust", "linear"):
+        raise SystemExit(f"--reward must be robust or linear, got {script_args.reward!r}")
+    base = robust_time_reward if script_args.reward == "robust" else time_reward
+    reward_funcs = [make_time_reward(script_args.log_samples_every, base=base), format_reward]
     cfg.reward_weights = [script_args.time_weight, script_args.format_weight]
-    if script_args.thinking:
+    if script_args.thinking and script_args.reward == "robust":
+        reward_funcs.append(consistency_reward)  # implies a well-formed <thinking> block
+        cfg.reward_weights.append(script_args.consistency_weight)
+    elif script_args.thinking:
         reward_funcs.append(thinking_format_reward)
         cfg.reward_weights.append(script_args.think_weight)
+    print("rewards:", {f.__name__: w for f, w in zip(reward_funcs, cfg.reward_weights)})
 
     root = script_args.data_root
     train_rows = load_split(f"{root}/labels/train.jsonl", root)

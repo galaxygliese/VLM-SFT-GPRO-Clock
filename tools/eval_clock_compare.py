@@ -35,7 +35,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from clock_utils import TIME_RE, get_prompt, load_split  # noqa: E402
+from utils.clock_utils import TIME_RE, get_prompt, load_split  # noqa: E402
 from eval_clock_checkpoints import metrics, score  # noqa: E402
 
 

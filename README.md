@@ -16,11 +16,11 @@ Everything runs on one RTX 5090 (32 GB). Environment: `~/.dev_venv` (torch 2.13,
 | `tools/prepare_clock_data.py` | TickTockVQA subset → `data/clock/{train,eval}` (simple, upright, CC BY 4.0 clocks) |
 | `tools/prepare_clock_testset.py` | full TickTockVQA test split (5,247 images) → `data/clock_full` for the paper benchmark |
 | `clock_synth.py` | synthetic analog clocks with exact labels → `data/clock_synth` |
-| `clock_utils.py` | clock prompt, time parsing, rewards, and `think_template()` (reference reasoning for SFT) |
+| `utils/clock_utils.py` | clock prompt, time parsing, rewards, and `think_template()` (reference reasoning for SFT) |
 | `train_clock_sft.py` | SFT warm-up (LoRA) on synthetic + real clocks |
 | `train_clock_grpo.py` | GRPO (LoRA), optionally with synthetic data (`--synth_root`) and from the SFT adapter (`--init_adapter`) |
 | `eval_clock.py`, `tools/eval_clock_checkpoints.py`, `tools/eval_clock_compare.py` | one model / every checkpoint of a run / several models side by side |
-| `tools/make_labels.py`, `bbox_utils.py`, `train_bbox_gpro.py`, `eval_bbox.py` | bbox pseudo-labels, rewards, training and eval |
+| `tools/make_labels.py`, `utils/bbox_utils.py`, `train_bbox_gpro.py`, `eval_bbox.py` | bbox pseudo-labels, rewards, training and eval |
 | `grpo_common.py` | vLLM image-placeholder patch, thinking-probe callback |
 | `tools/show_thinking.py` | print how the thinking changes across checkpoints |
 
@@ -58,13 +58,16 @@ python tools/eval_clock_compare.py sft=outputs/sft-clock-think/final \
 | stage | data | steps | settings |
 |---|---|---:|---|
 | **SFT** | 5,000 synthetic + 765 real | 361 | LoRA r=64, lr 1e-4 cosine, 16 images/step, loss on completion only |
-| **GRPO** (from the SFT adapter) | 1,000 synthetic + 765 real | 441 | 4 images × 8 rollouts/step, lr 2e-5 constant, β=0, DAPO loss, T=1.0 |
+| **GRPO v1** (from the SFT adapter) | 1,000 synthetic + 765 real | 441 | 4 images × 8 rollouts/step, lr 2e-5 constant, β=0, DAPO loss, T=1.0, `--reward linear` |
+| **GRPO v2** (from the SFT adapter) | 1,000 synthetic + 765 real | 200 (step 100 reported) | 4 images × 8 rollouts/step, lr 5e-6 cosine, β=0.04, DAPO loss, T=1.0, `--reward robust` |
 
-The SFT target is a reference reasoning generated from the label by `clock_utils.think_template()`. It follows the steps the prompt asks for. For 3:47:
+The SFT target is a reference reasoning generated from the label by `utils/clock_utils.think_template()`. It follows the steps the prompt asks for. For 3:47:
 
 > The hour hand (shorter) is about three quarters of the way from the 3 to the 4. The minute hand (longer) is 2 ticks past the 9, so 45 + 2 = 47 minutes. At 47 minutes the hour hand should be close to the 4 without reaching it, which matches, so the hour is still 3. The time is 3:47.
 
-GRPO rewards: `time_reward` (1.0, full credit within ±1 min on the 12-hour dial, linear to 0 at 30 min off), `format_reward` (0.25, answer is exactly `HH:MM`) and `thinking_format_reward` (0.25, a non-empty `<thinking>` block).
+GRPO rewards (`train_clock_grpo.py --reward`):
+- **v1, `linear`:** `time_reward` (1.0, full credit within ±1 min on the 12-hour dial, linear to 0 at 30 min off), `format_reward` (0.25, answer is exactly `HH:MM`) and `thinking_format_reward` (0.25, a non-empty `<thinking>` block).
+- **v2, `robust` (default):** `robust_time_reward` (1.0, continuous in the dial error: `0.7 / (1 + (err/12)²) + 0.3 · (1 − err/360)`, so 6 min off keeps 0.86 and 1 hour off keeps 0.28 instead of 0), `consistency_reward` (0.5, "The time is H:MM" at the end of the reasoning equals the answer) and `format_reward` (0.25).
 
 ### Results
 
@@ -74,9 +77,9 @@ All rows use the same 100 eval images with greedy decoding (`tools/eval_clock_co
 |---|---:|---:|---:|---:|
 | Base (zero-shot) | 9% | 17% | 28% | 73 min |
 | **SFT** | 23% | **50%** | **59%** | **6 min** |
-| SFT + GRPO, step 50 | 27% | 48% | 55% | 11 min |
-| SFT + GRPO, step 250 | **30%** | **52%** | 55% | 4 min |
-| SFT + GRPO, final (step 441) | 22% | 31% | 37% | 59 min |
+| SFT + GRPO v1, step 50 | 27% | 48% | 55% | 11 min |
+| SFT + GRPO v1, step 250 | **30%** | **52%** | 55% | 4 min |
+| SFT + GRPO v1, final (step 441) | 22% | 31% | 37% | 59 min |
 
 Within-5-min accuracy by checkpoint:
 
@@ -88,7 +91,7 @@ base   SFT 100  SFT 200  SFT 361 | GRPO 50  GRPO 150  GRPO 250  GRPO 350  GRPO 4
 How to read these numbers:
 - With 100 images, one image is 1 point and 95% intervals are about ±10 points.
 - **SFT is a clear gain.** In a paired bootstrap, base → SFT is +33 points within 5 min [+22, +43] and +15 exact [+7, +24].
-- **GRPO after SFT does not reliably help.** Its checkpoints swing between 31% and 52%. Step 50 and step 250 match SFT within noise, and the final model is significantly worse. In a separate eval run where the final model scored 35% within 5 min, SFT → final was −15 points within 5 min [−26, −4] and −17 hour [−29, −5].
+- **GRPO v1 after SFT does not reliably help.** Its checkpoints swing between 31% and 52%. Step 50 and step 250 match SFT within noise, and the final model is significantly worse. In a separate eval run where the final model scored 35% within 5 min, SFT → final was −15 points within 5 min [−26, −4] and −17 hour [−29, −5].
 - Steps 50 and 250 were picked after seeing eval results, so their numbers are optimistic. Compare final checkpoints, or show the full curve.
 - vLLM with LoRA isn't perfectly deterministic: repeated evals of the same model differ by 1–2 points.
 
@@ -99,7 +102,8 @@ The full test split has 5,247 images: COCO 2,063, Open Images 1,940 and Clock Mo
 ```bash
 python tools/prepare_clock_testset.py      # -> data/clock_full/{test,labels} (local eval only: Clock Movies may not be redistributed)
 python tools/eval_clock_compare.py --root data/clock_full --split test --out outputs/bench_ticktock \
-    sft=outputs/sft-clock-think/final sft_grpo=outputs/grpo-clock-think-sft/final
+    sft=outputs/sft-clock-think/final sft_grpo=outputs/grpo-clock-think-sft/final \
+    sft_grpo_v2=outputs/grpo-clock-think-sft-robust/checkpoint-100
 ```
 
 Metric definitions:
@@ -113,7 +117,8 @@ Metric definitions:
 |---|---:|---:|---:|---:|---:|
 | Ours: base (Qwen3-VL-4B, zero-shot) | 29.08 | 32.36 | 13.57 | 16.31 | 121.35 |
 | **Ours: SFT** | **51.42** | 51.44 | **36.38** | **38.59** | **78.60** |
-| Ours: SFT + GRPO (final) | 33.83 | **53.04** | 24.99 | 27.48 | 94.02 |
+| Ours: SFT + GRPO v1 (final, step 441) | 33.83 | **53.04** | 24.99 | 27.48 | 94.02 |
+| Ours: SFT + GRPO v2 (step 100) | 50.73 | 50.85 | 35.47 | 37.32 | **77.46** |
 
 Full-time accuracy, compared with the paper:
 
@@ -122,8 +127,9 @@ Full-time accuracy, compared with the paper:
 | Llama-3.2-11B + Swap-DPO (paper's best) | 11B | 46.22 |
 | Llama-3.2-11B SFT | 11B | 45.78 |
 | **Ours: Qwen3-VL-4B SFT** | **4B** | **36.38** |
+| Ours: Qwen3-VL-4B SFT + GRPO v2 (step 100) | 4B | 35.47 |
 | Gemma3-12B + Swap-DPO | 12B | 35.32 |
-| Ours: Qwen3-VL-4B SFT + GRPO | 4B | 24.99 |
+| Ours: Qwen3-VL-4B SFT + GRPO v1 | 4B | 24.99 |
 | Qwen2.5-VL-7B + Swap-DPO | 7B | 23.06 |
 | Qwen2.5-VL-7B SFT | 7B | 20.34 |
 | It's About Time | – | 18.54 |
@@ -135,7 +141,8 @@ Rows not marked "Ours" are from the TickTockVQA paper.
 - **SFT doubles It's About Time** (36.4 vs 18.5) and beats every Qwen and Gemma result in the paper, with a smaller model and far less real data: 765 simple real images plus 5,000 synthetic, against the paper's 7,236 real images. With 5,247 images the 95% intervals are about ±1.3 points (SFT: 35.1–37.7).
 - **By source** (SFT full-time): Clock Movies 56.2, Open Images 42.1, COCO 19.1. COCO clocks are often small and far away.
 - **By clock type** (SFT full-time): alarm/desk 49.0 and wall 41.7, the two types it was trained on. Unseen types are lower: wristwatches 30.6, post clocks 26.4, tower clocks 17.3.
-- **GRPO is worse on every clock type and every source.** The hour suffers (51 → 34) while minutes hold (51 → 53), the same pattern as on the development set.
+- **GRPO v1 is worse on every clock type and every source.** The hour suffers (51 → 34) while minutes hold (51 → 53), the same pattern as on the development set.
+- **GRPO v2 matches SFT but doesn't beat it.** Paired over all 5,247 images, SFT → v2 step 100 is −0.97 full-time [−2.02, +0.06] and −0.59 hour [−1.30, +0.17]. Step 200 is no different (35.66 full-time). Alarm/desk clocks gain about 3 points (48.6 → 51.6, n=467) and wristwatches lose about 2 (30.6 → 28.1).
 
 Comparison caveats:
 - **Prompt:** our models use the thinking prompt. The paper uses a short `HH:MM`-only prompt.
@@ -144,7 +151,7 @@ Comparison caveats:
 - **Dev-set overlap:** our 100-image development set is a subset of this test split. It was used to compare checkpoints, but the models in this table are final adapters, not checkpoints picked on it.
 - **Don't use It's About Time's own ~80%** (Yang et al., 2022). That figure is measured on their own labels, with detector-cropped clocks, and isn't comparable with the numbers here.
 
-### How the thinking changes
+### How the thinking changes (GRPO v1)
 
 Measured on the 100 eval images:
 
@@ -161,7 +168,7 @@ Measured on the 100 eval images:
 
 A visual walkthrough of 4 eval clocks across all stages is in `outputs/thinking_evolution/thinking_timeline.html`.
 
-### Why GRPO degrades: the reward
+### Why GRPO v1 degrades: the reward
 
 The two format rewards are always 1 after SFT, so `time_reward` is the only signal. It scores the answer and never the reasoning:
 
@@ -172,11 +179,48 @@ The two format rewards are always 1 after SFT, so `time_reward` is the only sign
 
 An earlier GRPO run from the base model (765 real images, no SFT) collapsed differently. After about 95 steps it dropped the `<thinking>` block entirely and fell to 0% within 5 min. Losing the 0.25 thinking reward cost less than reasoning badly.
 
+### GRPO v2: continuous reward, consistency reward and KL
+
+v2 fixes the v1 failures with three changes:
+- **A continuous time reward** (`--reward robust`) with no cut-offs, so every rollout group has a signal. Groups where all rollouts got the same reward fell from 75% to about 1%.
+- **A consistency reward.**
+- **A KL penalty to the SFT model** (β=0.04), with lr 5e-6 cosine and 200 steps.
+
+```bash
+python train_clock_grpo.py --init_adapter outputs/sft-clock-think/final --reward robust \
+    --synth_root data/clock_synth --n_synth 1000 \
+    --beta 0.04 --learning_rate 5e-6 --lr_scheduler_type cosine --warmup_steps 10 \
+    --max_steps 200 --save_steps 25 --output_dir outputs/grpo-clock-think-sft-robust
+```
+
+Results on the 100 dev images (greedy):
+
+| | SFT | v2 step 25 | 50 | 100 | 150 | 200 |
+|---|---:|---:|---:|---:|---:|---:|
+| within 5 min | 49% | 50% | 47% | 48% | 51% | 50% |
+| exact (±1 min) | 23% | 25% | 26% | 28% | 31% | 28% |
+| reasoning states the time and matches the answer | 100 | 100 | 100 | 100 | 100 | 100 |
+| answer about 1 hour off | 13 | 13 | 14 | 13 | 13 | 13 |
+
+**What v2 fixes:** the reasoning template survives. Every checkpoint states its time, the answer always matches it, tick counting stays (92–95 of 100), and nothing collapses. KL to SFT stays around 0.003.
+
+**What it doesn't fix:** accuracy is flat, here and on the full test set (35.5 vs 36.4 full-time). Training reward starts at about 0.92 and doesn't rise, because the GRPO images are ones SFT already reads well.
+
+**A new shortcut: the minute reading becomes a hedge.** Count of the minute reading as ticks past a numeral, over the full test set (5,247 answers):
+
+| reading | on the mark | +1 tick | +2 | +3 | +4 |
+|---|---:|---:|---:|---:|---:|
+| SFT | 444 | 937 | 1,971 | 375 | 1,520 |
+| GRPO v2, step 100 | 532 | **3,484** | 1,226 | 0 | 5 |
+
+"Mark + 1 minute" is within ±1 minute of both the mark and 2 ticks past, and the continuous reward is almost flat within ±2 minutes. So GRPO learns to answer "1 tick past" instead of counting ticks. Answers still change for 74% of images, mostly by 1–5 minutes, and the moves closer to and further from the true time cancel out (1,914 vs 1,803).
+
+A visual walkthrough of 4 dev clocks across v2 checkpoints is in `outputs/thinking_evolution_robust/thinking_timeline_robust.html`.
+
 **Next:**
-- Score the hour and minute separately (minute error measured on the 60-minute dial).
-- Add a consistency reward: the time stated in the reasoning must equal the answer.
-- `--beta 0.02–0.04` and a decaying learning rate.
-- More diverse rollouts (T=1.2 or 16 per image).
+- **Harder GRPO data:** keep only images SFT reads correctly some of the time but not always, drawn from the full TickTockVQA train split (tower clocks, wristwatches, small clocks). Easy images give no learning signal.
+- **A sharper minute reward:** a scale of about 4 instead of 12, so being 2 minutes off costs visibly more than 1 and "+1 tick" stops paying.
+- **More exploration:** T=1.2 and 16 rollouts per image.
 
 ## 3. Bbox results
 

@@ -8,7 +8,7 @@ import re
 
 import numpy as np
 
-from bbox_utils import split_thinking, thinking_format_reward  # noqa: F401  (re-exported)
+from utils.bbox_utils import split_thinking, thinking_format_reward  # noqa: F401  (re-exported)
 
 PROMPT = ("What time does the analog clock in this image show? "
           "Answer with only the 12-hour time as HH:MM.")
@@ -145,6 +145,62 @@ def time_reward(completions, hour, minute, log_metric=None, **kwargs):
         if ok:
             log_metric("clock/median_err_min", float(np.median(ok)))
     return rewards
+
+
+ROBUST_SCALE = 12.0   # minutes: half credit of the Cauchy core at 12 min off
+ROBUST_TAIL = 0.3     # weight of the linear tail that keeps a gradient up to 6 h off
+STATED_RE = re.compile(r"The time is (\d{1,2}):(\d{2})")
+
+
+def robust_time_score(err, scale=ROBUST_SCALE, tail=ROBUST_TAIL):
+    """Continuous score in [0, 1] from the dial error in minutes (12-hour wraparound, max 360).
+
+    (1 - tail) * Cauchy(err / scale) + tail * (1 - err / 360)
+    - no thresholds: every extra minute costs a little, so 10:16 vs 10:22 (6 min) keeps ~0.86
+    - Cauchy core: sharp preference near the true time, gentle for small errors (label noise)
+    - linear tail: an hour-off answer (60 min) still beats a random one (180 min), so groups
+      of far-off rollouts still give GRPO a learning signal instead of all-zero rewards
+    """
+    core = 1.0 / (1.0 + (err / scale) ** 2)
+    return (1.0 - tail) * core + tail * (1.0 - min(err, 360) / 360.0)
+
+
+def robust_time_reward(completions, hour, minute, log_metric=None, **kwargs):
+    """GRPO reward: robust_time_score of the answer after </thinking>; unparseable -> 0."""
+    rewards, errs = [], []
+    for c, h, m in zip(completions, hour, minute):
+        pred, _ = parse_time(answer_of(_text(c)))
+        err = None if pred is None else dial_error(pred, h, m)
+        rewards.append(0.0 if err is None else robust_time_score(err))
+        errs.append(err)
+    if log_metric is not None:
+        ok = [e for e in errs if e is not None]
+        log_metric("clock/exact", float(np.mean([e is not None and e <= FULL_CREDIT_MIN for e in errs])))
+        log_metric("clock/within5", float(np.mean([e is not None and e <= 5 for e in errs])))
+        log_metric("clock/parsed", len(ok) / len(errs))
+        if ok:
+            log_metric("clock/median_err_min", float(np.median(ok)))
+    return rewards
+
+
+def consistency_reward(completions, **kwargs):
+    """1.0 if the thinking ends with 'The time is H:MM' and the answer is that same time.
+
+    Keeps the reasoning faithful to the answer: in the first SFT->GRPO run this statement
+    disappeared by step 250 and answers started to contradict the thinking.
+    """
+    out = []
+    for c in completions:
+        text = _text(c)
+        thinking, answer, ok = split_thinking(text)
+        stated = STATED_RE.findall(thinking) if ok else []
+        pred, _ = parse_time(answer)
+        if not stated or pred is None:
+            out.append(0.0)
+            continue
+        h, m = int(stated[-1][0]), int(stated[-1][1])
+        out.append(1.0 if (h % 12) * 60 + m == pred else 0.0)
+    return out
 
 
 def format_reward(completions, **kwargs):
