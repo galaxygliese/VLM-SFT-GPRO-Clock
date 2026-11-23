@@ -42,6 +42,57 @@ def load_split(path, root="data/clock"):
     return rows
 
 
+def _num(i):
+    return 12 if i % 12 == 0 else i % 12
+
+
+def think_template(hour, minute, rng=None):
+    """Reference reasoning for SFT, derived from the label: the steps PROMPT_THINK asks for.
+
+    The hour-hand position follows from the minutes (hour + minute/60), so the text is faithful to
+    any correctly labelled clock. `rng` (random.Random) varies the wording a little.
+    """
+    h, m = _num(hour), minute
+    nxt = _num(h + 1)
+    f = m / 60
+    if m == 0:
+        hour_pos = f"pointing at the {h}"
+    elif f < 0.15:
+        hour_pos = f"just past the {h}"
+    elif f < 0.35:
+        hour_pos = f"about a quarter of the way from the {h} to the {nxt}"
+    elif f < 0.6:
+        hour_pos = f"about halfway between the {h} and the {nxt}"
+    elif f < 0.85:
+        hour_pos = f"about three quarters of the way from the {h} to the {nxt}"
+    else:
+        hour_pos = f"almost at the {nxt} but not past it"
+
+    n, k = m // 5, m % 5
+    mark = _num(n)
+    if k == 0:
+        minute_pos = f"points at the {mark}" + (", so 00 minutes" if m == 0 else f", so {m} minutes")
+    else:
+        ticks = "tick" if k == 1 else "ticks"
+        base = 0 if n == 0 else n * 5
+        minute_pos = f"is {k} {ticks} past the {mark}, so {base} + {k} = {m} minutes"
+
+    if m == 0:
+        check = f"With 00 minutes the hour hand should sit on the {h}, and it does."
+    elif m >= 45:
+        check = (f"At {m} minutes the hour hand should be close to the {nxt} without reaching it, "
+                 f"which matches, so the hour is still {h}.")
+    else:
+        check = f"At {m} minutes the hour hand should be {int(round(f * 100))}% of the way past the {h}, which matches."
+
+    opener = "The clock face is visible."
+    if rng is not None:
+        opener = rng.choice(["The clock face is visible.", "I can see the analog clock face.",
+                             "Locating the clock face.", "There is one analog clock."])
+    return (f"{opener} The hour hand (shorter) is {hour_pos}. The minute hand (longer) {minute_pos}. "
+            f"{check} The time is {h}:{m:02d}.")
+
+
 def answer_of(text):
     """Text that is scored: after </thinking> (or all of it when there is no thinking tag)."""
     return split_thinking(text)[1]

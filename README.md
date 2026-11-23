@@ -1,293 +1,162 @@
 # VLM-GPRO-BBox
 
-GRPO training of a VLM for bounding-box detection on fisheye traffic-camera images (RTX 5090, 32 GB).
+## 1. Intro
 
-Environment: `~/.dev_venv` (torch 2.13, transformers 5.19, TRL 1.17, peft 0.19, vLLM 0.32, ultralytics 8.4).
+Reinforcement learning (GRPO) and supervised fine-tuning (SFT) of a small vision-language model, **Qwen3-VL-4B-Instruct + LoRA**, on two visual tasks, with explicit reasoning in `<thinking>…</thinking>` before the answer:
 
-## 1. Data and labels
+- **Analog clock reading** (main task): read `HH:MM` from real photos ([TickTockVQA](https://huggingface.co/datasets/Jaeha-Choi/TickTockVQA)) and from synthetic clocks we render ourselves.
+- **Bounding-box detection** on fisheye traffic-camera images ([FishEye8K](https://github.com/MoyoG/FishEye8K)) against SAM3 pseudo-labels.
 
-Images are in `data/fisheye8k/{train,eval}/` (133 train / 36 eval, 1080×1080 PNG). `data/` is git-ignored.
+Everything runs on one RTX 5090 (32 GB). Environment: `~/.dev_venv` (torch 2.13, transformers 5.19, TRL 1.17, peft 0.19, vLLM 0.32).
 
-The images came without labels, so the bounding boxes are **pseudo-labels** from SAM3, an open-vocabulary detector driven by text prompts (`facebook/sam3`, loaded through ultralytics).
+### Repository
 
-```bash
-python tools/make_labels.py --vis   # writes data/fisheye8k/labels/{train,eval}.jsonl and data/fisheye8k/vis/
-```
+| file | purpose |
+|---|---|
+| `tools/prepare_clock_data.py` | TickTockVQA subset → `data/clock/{train,eval}` (simple, upright, CC BY 4.0 clocks) |
+| `clock_synth.py` | synthetic analog clocks with exact labels → `data/clock_synth` |
+| `clock_utils.py` | clock prompt, time parsing, rewards, and `think_template()` (reference reasoning for SFT) |
+| `train_clock_sft.py` | SFT warm-up (LoRA) on synthetic + real clocks |
+| `train_clock_grpo.py` | GRPO (LoRA), optionally with synthetic data (`--synth_root`) and from the SFT adapter (`--init_adapter`) |
+| `eval_clock.py`, `tools/eval_clock_checkpoints.py`, `tools/eval_clock_compare.py` | one model / every checkpoint of a run / several models side by side |
+| `tools/make_labels.py`, `bbox_utils.py`, `train_bbox_gpro.py`, `eval_bbox.py` | bbox pseudo-labels, rewards, training and eval |
+| `grpo_common.py` | vLLM image-placeholder patch, thinking-probe callback |
+| `tools/show_thinking.py` | print how the thinking changes across checkpoints |
 
-Each JSONL line has this format (the bbox is absolute pixel `xyxy`):
-
-```json
-{"image": "train/xxx.png", "width": 1080, "height": 1080,
- "objects": [{"label": "car", "bbox": [x1, y1, x2, y2], "score": 0.93}]}
-```
-
-| class | SAM3 prompts | conf | train | eval |
-|---|---|---:|---:|---:|
-| car | car | 0.40 | 690 | 320 |
-| bus_truck | bus, truck | 0.40 | 173 | 45 |
-| human | person | 0.40 | 702 | 306 |
-| bike | motorcycle, scooter, bicycle | 0.40 | 1158 | 481 |
-| traffic_light | traffic light | 0.40 | 153 | 26 |
-| traffic_sign | traffic sign | 0.45 | 180 | 12 |
-| road_symbol | bicycle symbol / arrow / text painted on road | 0.50 | 357 | 110 |
-| crosswalk | crosswalk | 0.60 | 338 | 49 |
-
-Post-processing:
-- Prompts that map to the same class go through NMS together.
-- A box detected as both `car` and `bus_truck` keeps only the higher-scoring class.
-- A `road_symbol` box is dropped if it overlaps a vehicle, person or crosswalk, or if it covers more than a quarter of the image.
-
-Known limitations:
-- `road_symbol` is the noisiest class: it sometimes fires on manhole covers and misses some painted text.
-- `crosswalk` boxes can overlap at corners.
-- Riders are labelled as `human`, and their vehicle is labelled separately as `bike`.
-
-Check the images in `vis/` and fix the eval split by hand before using it as a benchmark.
-
-## 2. Model selection
-
-Candidates come from `../VLM-study`. Training needs BF16 weights. The cached Qwen FP8 checkpoints are dequantized to BF16 at load time (`FineGrainedFP8Config(dequantize=True)`). For full fidelity, use the original BF16 repo instead (`hf download Qwen/Qwen3-VL-4B-Instruct`).
-
-`tools/check_vram.py` measures one GRPO policy step. The test uses 1 image (max 1024² px, 1078 prompt tokens), G completions × 512 tokens, LoRA r=64 on all linear layers, and gradient checkpointing.
-
-| model | BF16 weights | G=8 peak | G=4 peak | zero-shot bbox output |
-|---|---:|---:|---:|---|
-| **Qwen3-VL-4B-Instruct** | 9.0 GiB | **21.9 GiB** | – | yes, `bbox_2d` JSON in 0–1000 coords |
-| Qwen3-VL-8B-Instruct | 16.3 GiB | OOM | 24.4 GiB | yes |
-
-**Selected: Qwen3-VL-4B-Instruct + LoRA.**
-- It fits G=8 with about 10 GB left for rollouts.
-- It already produces grounding JSON zero-shot, so the reward signal is non-zero from step 0.
-- In the VLM-study fisheye benchmark it matches InternVL3.5-4B, the best of the 4B models: 84% with the fisheye prompt, and 90% with zoom tiles.
-- TRL's `GRPOTrainer` supports Qwen-VL natively.
-- The 8B leaves no room for generation, even at G=4.
-- Full fine-tuning of the 4B would need about 64 GB of optimizer state, so it is out.
-- InternVL3.5 and Molmo2 do not have Qwen's native `bbox_2d` grounding format.
+### Quick start (clock)
 
 ```bash
-python tools/check_vram.py --model Qwen/Qwen3-VL-4B-Instruct-FP8 --G 8 --L 512
+python tools/dequantize_fp8.py                                  # once: BF16 base -> checkpoints/Qwen3-VL-4B-Instruct-bf16
+python tools/prepare_clock_data.py --n_train -1 --n_eval 100    # 765 real train / 100 real eval
+python clock_synth.py --n 5000                                  # 5000 synthetic train clocks
+
+python train_clock_sft.py                                       # -> outputs/sft-clock-think/final
+python train_clock_grpo.py --synth_root data/clock_synth --n_synth 1000 \
+    --init_adapter outputs/sft-clock-think/final --output_dir outputs/grpo-clock-think-sft
+
+python tools/eval_clock_compare.py sft=outputs/sft-clock-think/final \
+    sft_grpo=outputs/grpo-clock-think-sft/final                 # base + adapters, one vLLM load
 ```
 
-## 3. GRPO training (object detection)
+### Setup notes
 
-The task covers 6 classes: `car`, `bus_truck`, `human`, `bike`, `traffic_sign` and `crosswalk`. `traffic_light` and `road_symbol` are left out. The model returns a JSON list of `{"bbox_2d": [x1, y1, x2, y2], "label": ...}`, with coordinates in Qwen's 0–1000 relative range. The prompt is in `bbox_utils.py`.
+- **BF16 base model is required.** vLLM can't sync LoRA-merged weights into FP8 layers, so training starts from a dequantized copy (`tools/dequantize_fp8.py`).
+- **vLLM image placeholders.** TRL 1.17 passes image-expanded prompt IDs, and vLLM 0.32 expands Qwen3-VL images a second time. `grpo_common.patch_vllm_image_placeholders()` collapses them before generation.
+- **Left padding.** The processor must use `padding_side="left"`. Right padding misaligns Qwen3-VL's `mm_token_type_ids` when image sizes differ, and training crashes in `get_rope_index`.
+- **Answer-only scoring.** Only the text after `</thinking>` is scored, and the tag is `<thinking>`, not Qwen's `<think>`, so the chat template leaves it alone.
 
-```bash
-python tools/dequantize_fp8.py   # once: BF16 copy -> checkpoints/Qwen3-VL-4B-Instruct-bf16 (9.1 GB)
-python eval_bbox.py              # baseline accuracy on the eval split
-python train_bbox_gpro.py                   # GRPO + LoRA with <thinking> -> outputs/grpo-bbox-think (wandb "vlm-grpo-bbox")
-python train_bbox_gpro.py --thinking false  # JSON-only variant      -> outputs/grpo-bbox
-python eval_bbox.py --thinking --adapter outputs/grpo-bbox-think/checkpoint-100
-python eval_bbox.py --adapter outputs/grpo-bbox/checkpoint-100
-```
+## 2. Clock results
 
-**Rewards** (both in `bbox_utils.py`):
-- `detection_reward` (weight 1.0) is a soft F1. Predictions are matched to labels per class with Hungarian matching. Each matched pair with IoU ≥ 0.5 contributes its IoU. The reward is `2·ΣIoU / (n_pred + n_gt)`. Wrong labels, extra boxes and missed objects all lower it.
-- `thinking_format_reward` (weight 0.25, thinking mode only) is 1.0 for a single non-empty `<thinking>…</thinking>` block before the answer. Thinking longer than 2,000 characters loses credit linearly and reaches 0 at 4,000.
-- `format_reward` (weight 0.5) checks that the output is a clean JSON list with known labels and boxes inside [0, 1000]. The parser is lenient, so a truncated list still earns detection credit for the objects it finished.
+### Data
 
-**Setup.** LoRA r=64 is applied to the language-model linear layers; the vision tower is frozen. Each step uses 8 rollouts per image and 4 images, so 32 completions. Other settings:
-- lr 2e-5, β=0 (no reference model), DAPO loss
-- `max_completion_length` 3072: the longest ground-truth JSON is 2.0k tokens, and thinking needs room on top
-- rollouts come from vLLM on the same GPU, which sleeps during backprop
-- 5 epochs = 165 steps, about 3 min per step in thinking mode (about 8 h in total), peak VRAM 27.6 GB
-- every 25 steps the eval split is scored with the rewards and a checkpoint is saved
+- **Real:** TickTockVQA "simple" clocks (upright, wall or alarm/desk, Arabic numerals, CC BY 4.0). Train has 765 images, mostly CC12M product shots, with clocks within 5 min of 10:10 removed (that pose is the base model's default guess). Eval has 100 images from COCO 2017 and Open Images scenes, where the clock is often small.
+- **Synthetic:** 5,000 rendered clocks on random-colour backgrounds, with times uniform over the 12-hour dial. Faces, numerals (Arabic, Roman, 12/3/6/9 only, none), ticks, hand shapes, an optional second hand, rotation and blur all vary. Labels are exact.
 
-**The BF16 base model is required.** vLLM can't take LoRA-merged weight syncs into FP8 layers, so training starts from a dequantized copy. `save_pretrained()` on a dequantized model re-quantizes to FP8, so the script copies the weights into a plain model first.
+### Training
 
-**vLLM workaround.** TRL 1.17 passes prompt token IDs that are already image-expanded. vLLM 0.32 expands Qwen3-VL images a second time (1,313 → 2,468 tokens). `patch_vllm_image_placeholders()` collapses each `<|image_pad|>` run before generation. TRL only uses vLLM's completion IDs, so training inputs are unchanged.
+| stage | data | steps | settings |
+|---|---|---:|---|
+| **SFT** | 5,000 synthetic + 765 real | 361 | LoRA r=64, lr 1e-4 cosine, 16 images/step, loss on completion only |
+| **GRPO** (from the SFT adapter) | 1,000 synthetic + 765 real | 441 | 4 images × 8 rollouts/step, lr 2e-5 constant, β=0, DAPO loss, T=1.0 |
 
-### Thinking mode
+The SFT target is a reference reasoning generated from the label by `clock_utils.think_template()`. It follows the steps the prompt asks for. For 3:47:
 
-The goal is better detection: the model first reasons about which classes are present and where, then writes the boxes.
+> The hour hand (shorter) is about three quarters of the way from the 3 to the 4. The minute hand (longer) is 2 ticks past the 9, so 45 + 2 = 47 minutes. At 47 minutes the hour hand should be close to the 4 without reaching it, which matches, so the hour is still 3. The time is 3:47.
 
-- **Prompt** (`PROMPT_THINK` in `bbox_utils.py`): scan the image region by region (top, left, center, right, bottom, rim) and note the classes, counts and locations in each region inside `<thinking></thinking>`. Then output only the JSON list after `</thinking>`.
-- **Scoring:** only the JSON after `</thinking>` is scored. Boxes written inside the thinking earn nothing, and an unclosed or truncated `<thinking>` scores 0.
-- **The tag is `<thinking>`, not Qwen's `<think>`,** so the chat template's reasoning handling doesn't touch it.
-- **wandb:** the sample table has a separate `thinking` column. `think/well_formed` and `think/chars` track format compliance and thinking length.
+GRPO rewards: `time_reward` (1.0, full credit within ±1 min on the 12-hour dial, linear to 0 at 30 min off), `format_reward` (0.25, answer is exactly `HH:MM`) and `thinking_format_reward` (0.25, a non-empty `<thinking>` block).
 
-Zero-shot, the base model already follows the format, so GRPO has a signal from step 0:
+### Results
 
-| eval split, greedy | thinking well-formed | P | R | F1 | soft F1 | strict JSON | truncated |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| JSON only | – | 0.069 | 0.173 | 0.099 | 0.074 | 14% | 86% |
-| `<thinking>` | 97% | 0.082 | 0.142 | 0.104 | 0.106 | 31% | 61% |
+All rows use the same 100 eval images with greedy decoding (`tools/eval_clock_compare.py`).
 
-With sampling at temperature 1.0 on 32 train images, 91% of outputs are well-formed, the thinking averages about 540 characters, and nothing is truncated. The base model's thinking names classes per region but rarely gives counts or positions. That missing detail is what the detection reward should push it to add.
-
-### Baseline accuracy (Qwen3-VL-4B-Instruct, zero-shot, greedy, eval split)
-
-The scores are measured against SAM3 pseudo-labels at IoU ≥ 0.5. VLM outputs have no confidence scores, so P/R/F1 are reported instead of mAP.
-
-| class | n_gt | n_pred | P | R | F1 |
-|---|---:|---:|---:|---:|---:|
-| car | 320 | 540 | 0.207 | 0.350 | 0.260 |
-| bus_truck | 45 | 35 | 0.543 | 0.422 | 0.475 |
-| human | 306 | 1104 | 0.034 | 0.121 | 0.052 |
-| bike | 481 | 1135 | 0.034 | 0.081 | 0.048 |
-| traffic_sign | 12 | 157 | 0.000 | 0.000 | 0.000 |
-| crosswalk | 49 | 54 | 0.056 | 0.061 | 0.058 |
-| **all (micro)** | 1213 | 3025 | **0.069** | **0.173** | **0.099** |
-
-Summary: macro F1 0.149, soft F1 (the reward) 0.074, strict JSON 14%, truncated at 3,072 tokens 86%.
-
-The main failure is degenerate repetition under greedy decoding. After the first few objects the model counts boxes upward in a fixed step, for example `[880, 1460, …]`, `[880, 1480, …]` with y going past 1000. A third of the predicted boxes are duplicates. The boxes it does match are well placed (matched IoU about 0.70). Sampling at temperature 1.0 already avoids most loops: the train-set detection reward is about 0.17 at the first GRPO step.
-
-## 4. Clock-reading data (TickTockVQA subset)
-
-This is a small, simpler task for training reasoning VLMs: read the time on an analog clock. It comes from [TickTockVQA](https://huggingface.co/datasets/Jaeha-Choi/TickTockVQA) (CVPR 2026 Findings, arXiv 2603.08011).
-
-```bash
-python tools/prepare_clock_data.py   # -> data/clock/{train,eval}/*.jpg + data/clock/labels/{train,eval}.jsonl
-```
-
-- **Split:** 100 train images come from the dataset's *train* split and 20 eval images from its *test* split, so the two can't overlap. The seed is fixed. Use `--n_train` / `--n_eval` for more; there are 911 / 290 simple candidates (765 train after `--drop_1010`). A request larger than the pool is capped, and `-1` takes all of them.
-- **Simple cases:** `transformation == Normal`, wall or alarm/desk clocks, Arabic numerals.
-- **License:** only CC BY 4.0 rows (commercial use and redistribution allowed). Attribution fields are kept per image.
-- **Label:** 12-hour `time` as `hh:mm`, plus `hour` (1–12) and `minute`. The dataset's AM/PM is kept as `ampm`, but a clock face can't show it, so it isn't part of the answer.
-
-Caveats:
-- Train is mostly CC12M product shots (large, centered clocks). Eval is COCO / OpenImages scenes, where the clock is sometimes small. Expect lower scores on eval.
-- 16 of the 100 train clocks show about 10:10, the classic product-photo pose, so the hour distribution is skewed toward 10.
-- The `design` field can list several numeral styles, so a few train clocks have Roman numerals. A few CC12M images carry stock-photo watermarks.
-
-## 5. Clock-reading GRPO with thinking
-
-```bash
-python tools/prepare_clock_data.py          # 100 train / 20 eval (see section 4)
-python eval_clock.py --thinking             # baseline
-python train_clock_grpo.py                  # thinking mode -> outputs/grpo-clock-think, wandb project "vlm-grpo-clock"
-python train_clock_grpo.py --thinking false # HH:MM only    -> outputs/grpo-clock
-python eval_clock.py --thinking --adapter outputs/grpo-clock-think/checkpoint-100
-```
-
-- **Prompt** (`clock_utils.PROMPT_THINK`): inside `<thinking>`, find the hour hand (shorter) and the minute hand (longer), say what each points at, compute the minutes, check that the hour hand's position between two numbers agrees, then state the time. After `</thinking>`, output only `HH:MM`.
-- **Rewards:**
-  - `time_reward` (1.0): full credit within ±1 min on the 12-hour dial (wrapping at 12), falling linearly to 0 at 30 min off.
-  - `format_reward` (0.25): the answer is exactly `HH:MM`.
-  - `thinking_format_reward` (0.25).
-- **Setup:** 4 images × 8 rollouts per step, 25 steps per epoch, 10 epochs = 250 steps. Steps take about 6–25 s (about 40 min in total), peak VRAM is 25 GB, and eval and saving happen every 25 steps.
-- **Processor padding:** the processor must use left padding (`padding_side="left"`, as TRL's own default does). A right-padded processor misaligns Qwen3-VL's `mm_token_type_ids` whenever image sizes differ, and the run crashes with a `get_rope_index` shape mismatch.
-
-Zero-shot baseline (eval split, greedy):
-
-| | exact (±1 min) | within 5 min | hour correct | median error |
+| model | exact (±1 min) | within 5 min | hour correct | median error |
 |---|---:|---:|---:|---:|
-| HH:MM only | 25% | 40% | 45% | 38 min |
-| `<thinking>` | 5% | 15% | 25% | 130 min |
+| Base (zero-shot) | 9% | 17% | 28% | 73 min |
+| **SFT** | 23% | **50%** | **59%** | **6 min** |
+| SFT + GRPO, step 50 | 27% | 48% | 55% | 11 min |
+| SFT + GRPO, step 250 | **30%** | **52%** | 55% | 4 min |
+| SFT + GRPO, final (step 441) | 22% | 31% | 37% | 59 min |
 
-Thinking *hurts* zero-shot. The model writes a "hour hand just past the 10, minute hand at the 2 → 10:10" story from its prior and answers 10:10 on 7 of 20 clocks. That is why `prepare_clock_data.py --drop_1010` (on by default) removes clocks near 10:10 from train: otherwise the prior gets rewarded.
+Within-5-min accuracy by checkpoint:
 
-## 6. Tracking how the thinking changes
-
-`grpo_common.ThinkingProbeCallback` is on in both trainers. At step 0 and at every checkpoint save, the current policy answers a **fixed** set of eval images with greedy decoding: 8 for clock, 4 for bbox (`--n_probe`). Because the images and decoding are fixed, the outputs can be compared across steps. They are written to:
-- `<output_dir>/checkpoint-N/thinking_probe.jsonl` (thinking, answer and score per image)
-- `<output_dir>/thinking_probes.jsonl` (all steps, including step 0)
-- wandb: the `thinking_probe` table and the `probe/score` and `probe/think_chars` scalars
-
-Separately, the wandb `samples` table shows random training rollouts every 10 steps.
-
-```bash
-python tools/show_thinking.py outputs/grpo-clock-think                       # per-step summary + one image across steps
-python tools/show_thinking.py outputs/grpo-clock-think --all --chars 0       # every probe image, full thinking
-# older checkpoints without probes: run the eval on them first, it saves per-image thinking in the checkpoint dir
-python eval_bbox.py --thinking --adapter outputs/grpo-bbox-think/checkpoint-50
-python tools/show_thinking.py outputs/grpo-bbox-think --base outputs/eval/base_eval_think.jsonl
+```
+base   SFT 100  SFT 200  SFT 361 | GRPO 50  GRPO 150  GRPO 250  GRPO 350  GRPO 441
+ 17%     42%      48%      50%   |   48%      37%       52%       32%       31%
 ```
 
-Backfilled bbox thinking run (`outputs/grpo-bbox-think`, eval split, greedy):
+How to read these numbers:
+- With 100 images, one image is 1 point and 95% intervals are about ±10 points.
+- **SFT is a clear gain.** In a paired bootstrap, base → SFT is +33 points within 5 min [+22, +43] and +15 exact [+7, +24].
+- **GRPO after SFT does not reliably help.** Its checkpoints swing between 31% and 52%. Step 50 and step 250 match SFT within noise, and the final model is significantly worse. In a separate eval run where the final model scored 35% within 5 min, SFT → final was −15 points within 5 min [−26, −4] and −17 hour [−29, −5].
+- Steps 50 and 250 were picked after seeing eval results, so their numbers are optimistic. Compare final checkpoints, or show the full curve.
+- vLLM with LoRA isn't perfectly deterministic: repeated evals of the same model differ by 1–2 points.
 
-| step | P | R | F1 | soft F1 | truncated | boxes predicted (GT 1,213) | thinking chars |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 (base) | 0.082 | 0.142 | 0.104 | 0.106 | 61% | 2092 | 665 |
-| 25 | 0.100 | 0.188 | 0.131 | 0.128 | 56% | 2270 | 496 |
-| 50 | 0.400 | 0.228 | 0.290 | 0.247 | 6% | 690 | 547 |
-| 75 | 0.540 | 0.233 | 0.326 | 0.262 | 3% | 524 | 499 |
+### How the thinking changes
 
-By step 50 the thinking turned from scene description into an explicit inventory ("3 cars, 1 bus, 1 human, no bikes"), and the repetition loops disappeared. Recall is flat at about 0.23. The policy became conservative: it predicts 524 boxes against 1,213 labels, and it often says "no bikes" where SAM3 labelled rows of parked scooters.
+Measured on the 100 eval images:
 
-## 7. Clock GRPO results, 100 train images (`outputs/grpo-clock-think-100`)
+| | Base | SFT | GRPO 50 | GRPO 250 | GRPO final |
+|---|---:|---:|---:|---:|---:|
+| reasoning counts minute ticks | 0 | 95 | 0 | 0 | 0 |
+| answer is a multiple of 5 min | 97 | 5 | 100 | 100 | 53 |
+| reasoning states "The time is …" | 0 | 100 | 100 | 0 | 0 |
+| answer about 1 hour off | 23 | 11 | 16 | 18 | 27 |
 
-The run used the `train_clock_grpo.py` defaults: 100 train images, 10 epochs = 250 steps, thinking mode. It was evaluated on the 20 eval images with greedy decoding:
+1. **Base:** a short story from its prior. It answers 10:10 on 24 of 100 clocks.
+2. **SFT:** the full template, including tick counting and the hour-hand check. The answer always matches the time stated in the reasoning.
+3. **GRPO:** within 50 steps it stops counting ticks and rounds to 5 minutes. By step 250 the "The time is" conclusion is gone. At the end, the consistency check is self-contradicting boilerplate ("should be 3% of the way past the 11, but it's 18% of the way before it, so it matches"), and the answer sometimes disagrees with the reasoning.
 
-```bash
-python tools/eval_clock_checkpoints.py outputs/grpo-clock-think-100   # base + every checkpoint, one vLLM load
-```
+A visual walkthrough of 4 eval clocks across all stages is in `outputs/thinking_evolution/thinking_timeline.html`.
 
-Full outputs are in `outputs/grpo-clock-think-100/thinking_progress/`:
-- `report.md`: per image, the GT and the thinking and read time at every step
-- `progress.csv` / `progress.jsonl`: thinking, read time and GT per step and image
-- `metrics.csv`: metrics per step
+### Why GRPO degrades: the reward
 
-`final` is identical to `checkpoint-250`.
+The two format rewards are always 1 after SFT, so `time_reward` is the only signal. It scores the answer and never the reasoning:
 
-| | base | step 50 | step 100 | step 150 | step 200 | final (250) |
-|---|---|---|---|---|---|---|
-| **exact (±1 min)** | 5% | 15% | 15% | **20%** | 15% | 0% |
-| **within 5 min** | 20% | **35%** | 25% | **35%** | 25% | 0% |
-| **hour correct** | 35% | 35% | **40%** | 35% | 30% | 15% |
-| **median error (min)** | 134 | **56** | 68 | 59 | 58 | 108 |
-| **mean reward** | 0.229 | **0.410** | 0.264 | 0.345 | 0.284 | 0.102 |
-| **thinking chars (mean)** | 185 | 200 | 94 | 74 | 77 | 77 |
-| **thinking, `clock_004` (GT 10:02)** | The clock face shows the hour hand pointing just past the 10 and the minute hand pointing at the 12, indicating 10:00. → **10:00** | Hour hand points just past the 10, minute hand points at the 12. Minute hand at 12 means 00 minutes. Hour hand slightly past 10 confirms 10:00. All consistent. → **10:00** | Hour hand between 10 and 11, closer to 10; minute hand on 12. Hour hand aligns with 12 minutes. → **10:55** | Hour hand between 11 and 12, closer to 12; minute hand on 12. Hour hand aligns. → **11:55** | Hour hand between 11 and 12, closer to 12; minute hand on 12. Hour hand aligns. → **11:53** | Hour hand between 11:59, closer to 11; minute hand on 11:59. Hour hand aligns. → **11:59** |
-| **thinking, `clock_009` (GT 11:47)** | The clock face shows the hour hand pointing just past the 11 and the minute hand pointing at the 12, indicating 11:00. The small subdials for temperature and humidity are not relevant to the time. The red second hand is pointing near the 12, but the time is determined by the hour and minute hands. → **11:00** | Hour hand is just past the 12, minute hand is pointing at the 12, seconds hand is at 12. The hour hand is slightly past 12, consistent with 12:00. The small dials show no deviation from 12:00. All hands align with 12:00. → **12:00** | Hour hand between 12 and 1, closer to 12; minute hand on 12. Hour hand aligns with 12:00 minutes. → **11:47** ✅ | Hour hand between 12 and 1, closer to 12; minute hand on 12. Hour hand aligns. → **11:47** ✅ | Hour hand between 11 and 12, closer to 12; minute hand on 12. Hour hand aligns. → **11:46** ✅ | Hour hand between 11:59, closer to 11; minute hand on 11:59.59. Hour hand aligns. → **11:59:59** |
+- **Small errors are almost free.** 2 minutes off still earns 0.97 and 4 minutes earns 0.90, so rounding to 5 minutes replaces tick counting.
+- **An hour error scores 0,** the same as a random guess. 10:22 for 11:22 has the minutes exactly right but gets no credit, so nothing pushes the hour toward correct, and hour errors grow from 11 to 27.
+- **The reasoning is unscored,** so it drifts until it no longer supports the answer.
+- **Little signal per step, no anchor.** The SFT policy is nearly deterministic (entropy about 0.02), so in 75% of groups all 8 rollouts get the same reward. With β=0 and a constant learning rate, the few informative groups push the policy around, which explains the swinging curve.
 
-With 20 eval images, one image is 5 points, so steps 50–200 are roughly flat. The best checkpoint is around **step 150–175**: step 175 reaches exact 20%, within-5 30% and a median error of 44 min.
+An earlier GRPO run from the base model (765 real images, no SFT) collapsed differently. After about 95 steps it dropped the `<thinking>` block entirely and fell to 0% within 5 min. Losing the 0.25 thinking reward cost less than reasoning badly.
 
-**How the thinking changed:**
-1. **Base:** a free-form description driven by the prior. It reads 10:10 on 5 of 20 clocks, and the minute hand is almost always "at the 12".
-2. **Step 50:** a longer, step-by-step check ("Minute hand at 12 means 00 minutes … confirms 10:00. All consistent."). It still reads mostly whole hours.
-3. **Steps 100–200:** the thinking collapses into a fixed template, "Hour hand between X and Y, closer to X; minute hand on N. Hour hand aligns.", at about 75 characters. The 10:10 habit is gone.
-4. **Final:** degenerate. The thinking parrots "11:59", and most answers are 11:58 or 11:59, sometimes the invalid `11:59:59`.
+**Next:**
+- Score the hour and minute separately (minute error measured on the 60-minute dial).
+- Add a consistency reward: the time stated in the reasoning must equal the answer.
+- `--beta 0.02–0.04` and a decaying learning rate.
+- More diverse rollouts (T=1.2 or 16 per image).
 
-**The thinking does not support the answer.** From step 100 on, the minute hand is described as "on 12" even when the answer is 11:47 or 11:55. "Hour hand aligns" is a stock phrase, not a check that was actually done. The minutes in the answer come from somewhere other than the stated reasoning, so the thinking is not faithful.
+## 3. Bbox results
 
-**Why it collapsed after about step 175:** this is a training failure, not overfitting. The *training* reward fell from 1.10 (steps 151–175) to 0.79 (steps 226–250).
-- **Entropy dropped:** from 0.25 to about 0.02 by step 100, and completions shrank from 64 to 37 tokens. The 8 rollouts per image became nearly identical, which leaves GRPO with almost no learning signal.
-- **Nothing anchored the policy:** there is no KL term (β=0) and the learning rate stays constant at 2e-5, over 10 epochs of only 100 images.
+Six classes (`car`, `bus_truck`, `human`, `bike`, `traffic_sign`, `crosswalk`) on FishEye8K images: 133 train and 36 eval. Labels are SAM3 pseudo-labels from text prompts (`tools/make_labels.py`). The reward is a soft F1: Hungarian matching per class at IoU ≥ 0.5, summing IoU.
 
-**Next run:**
-- more data: `tools/prepare_clock_data.py --n_train 500` (765 candidates are available)
-- `--beta 0.02 --learning_rate 1e-5 --lr_scheduler_type cosine`, and fewer epochs
-- a consistency reward that compares the hand positions stated in the thinking with the final answer
+GRPO with thinking (`outputs/grpo-bbox-think`), eval split, greedy:
 
-## 8. Clock GRPO results, 765 train images (`outputs/grpo-clock-think`)
+| step | P | R | F1 | truncated | boxes predicted (GT 1,213) |
+|---:|---:|---:|---:|---:|---:|
+| 0 (base) | 0.082 | 0.142 | 0.104 | 61% | 2,092 |
+| 50 | 0.400 | 0.228 | 0.290 | 6% | 690 |
+| 75 | **0.540** | **0.233** | **0.326** | 3% | 524 |
 
-All simple candidates were used for training, and the run went for 3 epochs:
+F1 triples, mostly from precision. The base model's repetition loops (boxes counting upward until y > 1000) disappear, and the thinking becomes an explicit inventory ("3 cars, 1 bus, no bikes"). Recall stays at about 0.23: the policy predicts fewer than half as many boxes as there are labels.
 
-```bash
-python tools/prepare_clock_data.py --n_train -1          # 765 train (all simple candidates after --drop_1010) / 20 eval
-python train_clock_grpo.py --num_train_epochs 3 --save_steps 50   # 4 images/step -> 191 steps/epoch, 573 steps, ~51 min
-python tools/eval_clock_checkpoints.py outputs/grpo-clock-think --steps 50,150,300,450,573
-```
+## 4. Citations
 
-Every other setting is the section 5 default: lr 2e-5 constant, β=0, 8 rollouts. Evaluation used the same 20 eval images with greedy decoding.
+**Model and methods**
+- Qwen Team. *Qwen3-VL Technical Report.* arXiv:2511.21631, 2025.
+- Z. Shao et al. *DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models* (GRPO). arXiv:2402.03300, 2024.
+- Q. Yu et al. *DAPO: An Open-Source LLM Reinforcement Learning System at Scale.* arXiv:2503.14476, 2025.
+- E. J. Hu et al. *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022. arXiv:2106.09685.
+- N. Carion et al. *SAM 3: Segment Anything with Concepts.* ICLR 2026. arXiv:2511.16719.
+- W. Kwon et al. *Efficient Memory Management for Large Language Model Serving with PagedAttention* (vLLM). SOSP 2023. arXiv:2309.06180.
+- L. von Werra et al. *TRL: Transformer Reinforcement Learning.* https://github.com/huggingface/trl
 
-| | base | step 50 | step 150 | step 300 | step 450 | final (573) |
-|---|---:|---:|---:|---:|---:|---:|
-| **exact (±1 min)** | 5% | **20%** | 0% | 0% | 0% | 0% |
-| **within 5 min** | 20% | **35%** | 0% | 0% | 0% | 0% |
-| **hour correct** | 35% | **35%** | 20% | 15% | 5% | 20% |
-| **median error (min)** | 134 | **58** | 110 | 170 | 176 | 74 |
-| **thinking chars (mean)** | 185 | 34 | 0 | 0 | 0 | 0 |
+**Datasets**
+- J. Choi, J. W. Lee, S. You, J. Lee. *It's Time to Get It Right: Improving Analog Clock Reading and Clock-Hand Spatial Reasoning in Vision-Language Models* (TickTockVQA). CVPR 2026 Findings. arXiv:2603.08011.
+- M. Gochoo et al. *FishEye8K: A Benchmark and Dataset for Fisheye Camera Object Detection.* CVPR Workshops 2023. arXiv:2305.17449.
+- Sources of the TickTockVQA images used here, all CC BY 4.0:
+  - T.-Y. Lin et al. *Microsoft COCO: Common Objects in Context.* ECCV 2014. arXiv:1405.0312.
+  - A. Kuznetsova et al. *The Open Images Dataset V4.* IJCV 2020. arXiv:1811.00982.
+  - S. Changpinyo et al. *Conceptual 12M.* CVPR 2021. arXiv:2102.08981.
+  - R. Krishna et al. *Visual Genome.* IJCV 2017. arXiv:1602.07332.
 
-Examples (GT → output):
-- **`clock_004` (GT 10:02):**
-  - base: `<thinking>…hour hand just past the 10 and the minute hand pointing at the 12, indicating 10:00.</thinking> 10:00`
-  - step 50: `<thinking>11:00</thinking> 11:00`
-  - final: `8:59`
-- **`clock_009` (GT 11:47):** step 50 gives `<thinking>11:45</thinking> 11:45`, and the final model gives `11:59`.
-
-**The thinking collapsed, and the result is worse than the 100-image run.** Step 50 is the best checkpoint and matches the best of section 7. After that, every checkpoint is below the base model.
-1. **Steps 1–95:** the thinking shrinks from about 68 to about 12 tokens. By step 50 it only repeats the answer inside the tags.
-2. **Steps 95–97:** the model drops `<thinking>` altogether and outputs a bare `H:MM` (about 5 tokens). The `thinking_format_reward` falls from 1.0 to 0 and never recovers. Its weight is only 0.25, so skipping the reasoning costs little.
-3. **After the collapse:** 91% of groups get the same reward for all 8 rollouts (`frac_reward_zero_std`), compared with 57% before. The policy gets almost no gradient and stays stuck. Mean training reward falls from 0.88 (steps 1–95) to 0.41 (steps 97–573).
-
-More data did not help, because the failure is in the reward design, not in the amount of data. `time_reward` is 0 beyond 30 min of error, and the base model's median error is 134 min. So most groups carry no signal, and the cheap way to raise reward is to shorten or drop the thinking.
-
-**Next run:**
-- **A denser time reward:** score the hour and minute hands separately, with the minute error taken mod 60, so a hand mix-up still earns partial credit.
-- **Make thinking mandatory:** multiply the time reward by a "has thinking" gate, and give no credit for empty thinking (`<thinking>HH:MM</thinking>`).
-- **Anchor the policy:** `--beta 0.02 --learning_rate 1e-5`, and save every 10–25 steps early on.
-- **A bigger eval set:** `--n_eval 200` (290 candidates). With 20 images, one image moves every metric by 5 points.
-- **More training data:** synthetic rendered clocks, used for a short supervised warm-up before GRPO.
+Clock images keep their per-image attribution fields (`source`, `source_url`, `license`) in `data/clock/labels/*.jsonl`. Credit them when you redistribute or publish them.

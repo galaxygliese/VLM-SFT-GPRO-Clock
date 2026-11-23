@@ -15,6 +15,8 @@ and at every save -> <ckpt>/thinking_probe.jsonl, <output_dir>/thinking_probes.j
     python prepare: python tools/prepare_clock_data.py
     python train_clock_grpo.py
     python train_clock_grpo.py --thinking false --num_train_epochs 5
+    python train_clock_grpo.py --synth_root data/clock_synth --n_synth 1000          # + synthetic clocks
+    python train_clock_grpo.py --init_adapter outputs/sft-clock-think/final          # continue the SFT adapter
 """
 import os
 import sys
@@ -23,7 +25,8 @@ from dataclasses import dataclass, field
 import torch
 from datasets import Dataset, Features, Image, Value
 from peft import LoraConfig
-from transformers import AutoProcessor, HfArgumentParser
+from peft import PeftModel
+from transformers import AutoModelForImageTextToText, AutoProcessor, HfArgumentParser
 from trl import GRPOConfig, GRPOTrainer
 
 from clock_utils import (format_reward, get_prompt, load_split, probe_score, split_thinking,
@@ -36,6 +39,10 @@ class ScriptArgs:
     model: str = field(default="checkpoints/Qwen3-VL-4B-Instruct-bf16",
                        metadata={"help": "BF16 base model (tools/dequantize_fp8.py)"})
     data_root: str = "data/clock"
+    synth_root: str = field(default="", metadata={"help": "also train on clock_synth.py output, e.g. data/clock_synth"})
+    n_synth: int = field(default=-1, metadata={"help": "synthetic train images to add (-1 = all)"})
+    init_adapter: str = field(default="", metadata={"help": "start from this LoRA adapter (e.g. the SFT one) "
+                                                            "instead of a fresh one; --lora_* are then ignored"})
     thinking: bool = field(default=True, metadata={"help": "reason in <thinking></thinking> before HH:MM"})
     lora_r: int = 64
     lora_alpha: int = 128
@@ -152,21 +159,32 @@ def main():
     root = script_args.data_root
     train_rows = load_split(f"{root}/labels/train.jsonl", root)
     eval_rows = load_split(f"{root}/labels/eval.jsonl", root)
+    n_real = len(train_rows)
+    if script_args.synth_root:
+        syn = load_split(f"{script_args.synth_root}/labels/train.jsonl", script_args.synth_root)
+        train_rows += syn if script_args.n_synth < 0 else syn[:script_args.n_synth]
+    print(f"train: {n_real} real + {len(train_rows) - n_real} synthetic = {len(train_rows)} | eval: {len(eval_rows)}")
     # left padding like TRL's own default: prompts are left-padded, and a right-padded processor would
     # misalign mm_token_type_ids (Qwen3-VL M-RoPE) whenever image sizes / prompt lengths differ
     processor = AutoProcessor.from_pretrained(script_args.model, padding_side="left")
 
+    model, peft_config = script_args.model, LoraConfig(
+        r=script_args.lora_r, lora_alpha=script_args.lora_alpha, lora_dropout=script_args.lora_dropout,
+        task_type="CAUSAL_LM",
+        target_modules=r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)")
+    if script_args.init_adapter:  # keep training the given adapter (TRL accepts a PeftModel + peft_config=None)
+        base = AutoModelForImageTextToText.from_pretrained(script_args.model, dtype=torch.bfloat16)
+        model, peft_config = PeftModel.from_pretrained(base, script_args.init_adapter, is_trainable=True), None
+        print(f"init adapter: {script_args.init_adapter}")
+
     trainer = GRPOTrainer(
-        model=script_args.model,
+        model=model,
         reward_funcs=reward_funcs,
         args=cfg,
         train_dataset=build_dataset(train_rows, prompt),
         eval_dataset=build_dataset(eval_rows, prompt) if cfg.eval_strategy != "no" else None,
         processing_class=processor,
-        peft_config=LoraConfig(
-            r=script_args.lora_r, lora_alpha=script_args.lora_alpha, lora_dropout=script_args.lora_dropout,
-            task_type="CAUSAL_LM",
-            target_modules=r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"),
+        peft_config=peft_config,
     )
     patch_vllm_image_placeholders(trainer)
     if script_args.n_probe:
