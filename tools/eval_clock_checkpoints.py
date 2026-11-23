@@ -2,6 +2,7 @@
 and save thinking / read time / GT time per image and step.
 
     python tools/eval_clock_checkpoints.py outputs/grpo-clock-think
+    python tools/eval_clock_checkpoints.py outputs/grpo-clock-think --steps 150,300,450,573
 
 Writes to <run>/thinking_progress/:
     progress.jsonl   one row per (step, image): step, id, gt, read, err_min, score, thinking, completion
@@ -58,6 +59,8 @@ def main():
     ap.add_argument("--split", default="eval")
     ap.add_argument("--max_tokens", type=int, default=1024)
     ap.add_argument("--no_base", action="store_true")
+    ap.add_argument("--steps", type=lambda v: {int(x) for x in v.split(",")}, default=None,
+                    help="comma-separated checkpoint steps to evaluate (default: all)")
     args = ap.parse_args()
 
     from vllm import LLM, SamplingParams
@@ -65,6 +68,8 @@ def main():
 
     ckpts = sorted(glob.glob(os.path.join(args.run, "checkpoint-*")),
                    key=lambda d: int(re.search(r"checkpoint-(\d+)", d).group(1)))
+    if args.steps:
+        ckpts = [d for d in ckpts if int(re.search(r"checkpoint-(\d+)", d).group(1)) in args.steps]
     rows = load_split(f"{args.root}/labels/{args.split}.jsonl", args.root)
     llm = LLM(model=args.model, max_model_len=args.max_tokens + 2048, gpu_memory_utilization=0.85,
               limit_mm_per_prompt={"image": 1}, enable_lora=True, max_lora_rank=128, max_loras=1,

@@ -141,7 +141,7 @@ This is a small, simpler task for training reasoning VLMs: read the time on an a
 python tools/prepare_clock_data.py   # -> data/clock/{train,eval}/*.jpg + data/clock/labels/{train,eval}.jsonl
 ```
 
-- **Split:** 100 train images come from the dataset's *train* split and 20 eval images from its *test* split, so the two can't overlap. The seed is fixed. Use `--n_train` / `--n_eval` for more; there are 911 / 290 simple candidates.
+- **Split:** 100 train images come from the dataset's *train* split and 20 eval images from its *test* split, so the two can't overlap. The seed is fixed. Use `--n_train` / `--n_eval` for more; there are 911 / 290 simple candidates (765 train after `--drop_1010`). A request larger than the pool is capped, and `-1` takes all of them.
 - **Simple cases:** `transformation == Normal`, wall or alarm/desk clocks, Arabic numerals.
 - **License:** only CC BY 4.0 rows (commercial use and redistribution allowed). Attribution fields are kept per image.
 - **Label:** 12-hour `time` as `hh:mm`, plus `hour` (1–12) and `minute`. The dataset's AM/PM is kept as `ampm`, but a clock face can't show it, so it isn't part of the answer.
@@ -206,15 +206,15 @@ Backfilled bbox thinking run (`outputs/grpo-bbox-think`, eval split, greedy):
 
 By step 50 the thinking turned from scene description into an explicit inventory ("3 cars, 1 bus, 1 human, no bikes"), and the repetition loops disappeared. Recall is flat at about 0.23. The policy became conservative: it predicts 524 boxes against 1,213 labels, and it often says "no bikes" where SAM3 labelled rows of parked scooters.
 
-## 7. Clock GRPO results (`outputs/grpo-clock-think`)
+## 7. Clock GRPO results, 100 train images (`outputs/grpo-clock-think-100`)
 
 The run used the `train_clock_grpo.py` defaults: 100 train images, 10 epochs = 250 steps, thinking mode. It was evaluated on the 20 eval images with greedy decoding:
 
 ```bash
-python tools/eval_clock_checkpoints.py outputs/grpo-clock-think   # base + every checkpoint, one vLLM load
+python tools/eval_clock_checkpoints.py outputs/grpo-clock-think-100   # base + every checkpoint, one vLLM load
 ```
 
-Full outputs are in `outputs/grpo-clock-think/thinking_progress/`:
+Full outputs are in `outputs/grpo-clock-think-100/thinking_progress/`:
 - `report.md`: per image, the GT and the thinking and read time at every step
 - `progress.csv` / `progress.jsonl`: thinking, read time and GT per step and image
 - `metrics.csv`: metrics per step
@@ -250,3 +250,44 @@ With 20 eval images, one image is 5 points, so steps 50–200 are roughly flat. 
 - more data: `tools/prepare_clock_data.py --n_train 500` (765 candidates are available)
 - `--beta 0.02 --learning_rate 1e-5 --lr_scheduler_type cosine`, and fewer epochs
 - a consistency reward that compares the hand positions stated in the thinking with the final answer
+
+## 8. Clock GRPO results, 765 train images (`outputs/grpo-clock-think`)
+
+All simple candidates were used for training, and the run went for 3 epochs:
+
+```bash
+python tools/prepare_clock_data.py --n_train -1          # 765 train (all simple candidates after --drop_1010) / 20 eval
+python train_clock_grpo.py --num_train_epochs 3 --save_steps 50   # 4 images/step -> 191 steps/epoch, 573 steps, ~51 min
+python tools/eval_clock_checkpoints.py outputs/grpo-clock-think --steps 50,150,300,450,573
+```
+
+Every other setting is the section 5 default: lr 2e-5 constant, β=0, 8 rollouts. Evaluation used the same 20 eval images with greedy decoding.
+
+| | base | step 50 | step 150 | step 300 | step 450 | final (573) |
+|---|---:|---:|---:|---:|---:|---:|
+| **exact (±1 min)** | 5% | **20%** | 0% | 0% | 0% | 0% |
+| **within 5 min** | 20% | **35%** | 0% | 0% | 0% | 0% |
+| **hour correct** | 35% | **35%** | 20% | 15% | 5% | 20% |
+| **median error (min)** | 134 | **58** | 110 | 170 | 176 | 74 |
+| **thinking chars (mean)** | 185 | 34 | 0 | 0 | 0 | 0 |
+
+Examples (GT → output):
+- **`clock_004` (GT 10:02):**
+  - base: `<thinking>…hour hand just past the 10 and the minute hand pointing at the 12, indicating 10:00.</thinking> 10:00`
+  - step 50: `<thinking>11:00</thinking> 11:00`
+  - final: `8:59`
+- **`clock_009` (GT 11:47):** step 50 gives `<thinking>11:45</thinking> 11:45`, and the final model gives `11:59`.
+
+**The thinking collapsed, and the result is worse than the 100-image run.** Step 50 is the best checkpoint and matches the best of section 7. After that, every checkpoint is below the base model.
+1. **Steps 1–95:** the thinking shrinks from about 68 to about 12 tokens. By step 50 it only repeats the answer inside the tags.
+2. **Steps 95–97:** the model drops `<thinking>` altogether and outputs a bare `H:MM` (about 5 tokens). The `thinking_format_reward` falls from 1.0 to 0 and never recovers. Its weight is only 0.25, so skipping the reasoning costs little.
+3. **After the collapse:** 91% of groups get the same reward for all 8 rollouts (`frac_reward_zero_std`), compared with 57% before. The policy gets almost no gradient and stays stuck. Mean training reward falls from 0.88 (steps 1–95) to 0.41 (steps 97–573).
+
+More data did not help, because the failure is in the reward design, not in the amount of data. `time_reward` is 0 beyond 30 min of error, and the base model's median error is 134 min. So most groups carry no signal, and the cheap way to raise reward is to shorten or drop the thinking.
+
+**Next run:**
+- **A denser time reward:** score the hour and minute hands separately, with the minute error taken mod 60, so a hand mix-up still earns partial credit.
+- **Make thinking mandatory:** multiply the time reward by a "has thinking" gate, and give no credit for empty thinking (`<thinking>HH:MM</thinking>`).
+- **Anchor the policy:** `--beta 0.02 --learning_rate 1e-5`, and save every 10–25 steps early on.
+- **A bigger eval set:** `--n_eval 200` (290 candidates). With 20 images, one image moves every metric by 5 points.
+- **More training data:** synthetic rendered clocks, used for a short supervised warm-up before GRPO.

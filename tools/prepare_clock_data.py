@@ -12,6 +12,7 @@ The answer is 12-hour hh:mm (a clock face shows no AM/PM); the dataset's AM/PM i
 
     python tools/prepare_clock_data.py                 # 100 train / 20 eval
     python tools/prepare_clock_data.py --n_train 500   # more
+    python tools/prepare_clock_data.py --n_train -1    # every simple candidate (n is capped at the pool size)
 """
 import argparse
 import io
@@ -70,6 +71,10 @@ def main():
 
     os.makedirs(f"{args.out}/labels", exist_ok=True)
     for split, pool, n in (("train", train_pool, args.n_train), ("eval", test_pool, args.n_eval)):
+        if n < 0 or n > len(pool):
+            if n > len(pool):
+                print(f"WARNING: requested {n} {split} images but only {len(pool)} candidates; using all")
+            n = len(pool)
         sel = pool.sample(n=n, random_state=args.seed).reset_index(drop=True)
         os.makedirs(f"{args.out}/{split}", exist_ok=True)
         with open(f"{args.out}/labels/{split}.jsonl", "w") as f:
