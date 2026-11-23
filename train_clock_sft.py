@@ -26,7 +26,7 @@ from peft import LoraConfig
 from transformers import AutoProcessor, HfArgumentParser
 from trl import SFTConfig, SFTTrainer
 
-from clock_utils import get_prompt, load_split, think_template
+from utils.clock_utils import get_prompt, load_split, think_template
 import wandb
 
 @dataclass

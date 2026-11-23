@@ -32,7 +32,7 @@ from peft import LoraConfig
 from transformers import HfArgumentParser
 from trl import GRPOConfig, GRPOTrainer
 
-from bbox_utils import (CLASSES, answer_text, completion_text, detection_reward, format_reward, get_prompt,
+from utils.bbox_utils import (CLASSES, answer_text, completion_text, detection_reward, format_reward, get_prompt,
                         load_split, parse_objects, probe_score, split_thinking, thinking_format_reward)
 from grpo_common import ThinkingProbeCallback, patch_vllm_image_placeholders
 

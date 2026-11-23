@@ -14,8 +14,9 @@ import time
 import numpy as np
 from PIL import Image
 
-from clock_utils import get_prompt, load_split, parse_time, split_thinking, time_score
-
+from utils.clock_utils import get_prompt, load_split, parse_time, split_thinking, time_score
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 
 def main():
     ap = argparse.ArgumentParser()
@@ -28,9 +29,6 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=1024)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
     rows = load_split(f"{args.root}/labels/{args.split}.jsonl", args.root)
     llm = LLM(model=args.model, max_model_len=args.max_tokens + 2048, gpu_memory_utilization=0.85,

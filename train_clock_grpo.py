@@ -29,7 +29,7 @@ from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoProcessor, HfArgumentParser
 from trl import GRPOConfig, GRPOTrainer
 
-from clock_utils import (format_reward, get_prompt, load_split, probe_score, split_thinking,
+from utils.clock_utils import (format_reward, get_prompt, load_split, probe_score, split_thinking,
                          thinking_format_reward, time_reward, time_score)
 from grpo_common import ThinkingProbeCallback, patch_vllm_image_placeholders
 

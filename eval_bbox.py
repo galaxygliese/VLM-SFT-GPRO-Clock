@@ -16,8 +16,9 @@ import time
 import numpy as np
 from PIL import Image
 
-from bbox_utils import CLASSES, detection_score, get_prompt, load_split, match, parse_objects, prf, split_thinking
-
+from utils.bbox_utils import CLASSES, detection_score, get_prompt, load_split, match, parse_objects, prf, split_thinking
+from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 
 def main():
     ap = argparse.ArgumentParser()
@@ -32,9 +33,6 @@ def main():
     ap.add_argument("--out", default=None, help="predictions jsonl (default: next to adapter or outputs/eval/)")
     ap.add_argument("--wandb", action="store_true", help="log metrics to wandb project vlm-grpo-bbox")
     args = ap.parse_args()
-
-    from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
 
     rows = load_split(f"{args.root}/labels/{args.split}.jsonl")[:args.limit]
     llm = LLM(model=args.model, max_model_len=args.max_tokens + 2048, gpu_memory_utilization=0.85,

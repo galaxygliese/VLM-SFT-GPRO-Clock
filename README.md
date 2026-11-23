@@ -1,4 +1,4 @@
-# VLM-GPRO-BBox
+# VLM-SFT-GPRO-Clock
 
 ## 1. Intro
 
@@ -14,6 +14,7 @@ Everything runs on one RTX 5090 (32 GB). Environment: `~/.dev_venv` (torch 2.13,
 | file | purpose |
 |---|---|
 | `tools/prepare_clock_data.py` | TickTockVQA subset → `data/clock/{train,eval}` (simple, upright, CC BY 4.0 clocks) |
+| `tools/prepare_clock_testset.py` | full TickTockVQA test split (5,247 images) → `data/clock_full` for the paper benchmark |
 | `clock_synth.py` | synthetic analog clocks with exact labels → `data/clock_synth` |
 | `clock_utils.py` | clock prompt, time parsing, rewards, and `think_template()` (reference reasoning for SFT) |
 | `train_clock_sft.py` | SFT warm-up (LoRA) on synthetic + real clocks |
@@ -91,6 +92,58 @@ How to read these numbers:
 - Steps 50 and 250 were picked after seeing eval results, so their numbers are optimistic. Compare final checkpoints, or show the full curve.
 - vLLM with LoRA isn't perfectly deterministic: repeated evals of the same model differ by 1–2 points.
 
+### Benchmark: full TickTockVQA test set
+
+The full test split has 5,247 images: COCO 2,063, Open Images 1,940 and Clock Movies 1,244. Unlike the 100-image development set, it includes every clock type (tower, wristwatch, post…), partial and flipped clocks, and every license. Scores use the TickTockVQA paper's metrics, so they compare directly with its Table 1, which includes a re-run of It's About Time.
+
+```bash
+python tools/prepare_clock_testset.py      # -> data/clock_full/{test,labels} (local eval only: Clock Movies may not be redistributed)
+python tools/eval_clock_compare.py --root data/clock_full --split test --out outputs/bench_ticktock \
+    sft=outputs/sft-clock-think/final sft_grpo=outputs/grpo-clock-think-sft/final
+```
+
+Metric definitions:
+- **hour acc:** the hour is correct (12-hour dial).
+- **minute acc:** the minute is within ±2.
+- **full-time acc:** both are correct.
+- **swap ok:** also counts readings with the hour and minute hands swapped (e.g. 06:18 for 03:30).
+- **MAE:** mean dial error in minutes.
+
+| Model | Hour acc | Minute acc (±2) | Full-time acc | Full-time (swap ok) | MAE (min) |
+|---|---:|---:|---:|---:|---:|
+| Ours: base (Qwen3-VL-4B, zero-shot) | 29.08 | 32.36 | 13.57 | 16.31 | 121.35 |
+| **Ours: SFT** | **51.42** | 51.44 | **36.38** | **38.59** | **78.60** |
+| Ours: SFT + GRPO (final) | 33.83 | **53.04** | 24.99 | 27.48 | 94.02 |
+
+Full-time accuracy, compared with the paper:
+
+| Model | Params | Full-time acc |
+|---|---:|---:|
+| Llama-3.2-11B + Swap-DPO (paper's best) | 11B | 46.22 |
+| Llama-3.2-11B SFT | 11B | 45.78 |
+| **Ours: Qwen3-VL-4B SFT** | **4B** | **36.38** |
+| Gemma3-12B + Swap-DPO | 12B | 35.32 |
+| Ours: Qwen3-VL-4B SFT + GRPO | 4B | 24.99 |
+| Qwen2.5-VL-7B + Swap-DPO | 7B | 23.06 |
+| Qwen2.5-VL-7B SFT | 7B | 20.34 |
+| It's About Time | – | 18.54 |
+| Ours: Qwen3-VL-4B zero-shot | 4B | 13.57 |
+| Qwen2.5-VL-7B zero-shot | 7B | 6.04 |
+
+Rows not marked "Ours" are from the TickTockVQA paper.
+
+- **SFT doubles It's About Time** (36.4 vs 18.5) and beats every Qwen and Gemma result in the paper, with a smaller model and far less real data: 765 simple real images plus 5,000 synthetic, against the paper's 7,236 real images. With 5,247 images the 95% intervals are about ±1.3 points (SFT: 35.1–37.7).
+- **By source** (SFT full-time): Clock Movies 56.2, Open Images 42.1, COCO 19.1. COCO clocks are often small and far away.
+- **By clock type** (SFT full-time): alarm/desk 49.0 and wall 41.7, the two types it was trained on. Unseen types are lower: wristwatches 30.6, post clocks 26.4, tower clocks 17.3.
+- **GRPO is worse on every clock type and every source.** The hour suffers (51 → 34) while minutes hold (51 → 53), the same pattern as on the development set.
+
+Comparison caveats:
+- **Prompt:** our models use the thinking prompt. The paper uses a short `HH:MM`-only prompt.
+- **Image size:** Clock Movies frames above 1,920 px (up to 3840 px) are downscaled to 1,920 (`--max_side`). The paper doesn't say how it fed 4K frames to its models.
+- **Metric details:** the ±2-minute tolerance and the MAE definition follow our reading of the paper. Full-time accuracy is the most clearly defined metric, so compare on that.
+- **Dev-set overlap:** our 100-image development set is a subset of this test split. It was used to compare checkpoints, but the models in this table are final adapters, not checkpoints picked on it.
+- **Don't use It's About Time's own ~80%** (Yang et al., 2022). That figure is measured on their own labels, with detector-cropped clocks, and isn't comparable with the numbers here.
+
 ### How the thinking changes
 
 Measured on the 100 eval images:
@@ -151,6 +204,7 @@ F1 triples, mostly from precision. The base model's repetition loops (boxes coun
 - L. von Werra et al. *TRL: Transformer Reinforcement Learning.* https://github.com/huggingface/trl
 
 **Datasets**
+- C. Yang, W. Xie, A. Zisserman. *It's About Time: Analog Clock Reading in the Wild.* CVPR 2022. arXiv:2111.09162.
 - J. Choi, J. W. Lee, S. You, J. Lee. *It's Time to Get It Right: Improving Analog Clock Reading and Clock-Hand Spatial Reasoning in Vision-Language Models* (TickTockVQA). CVPR 2026 Findings. arXiv:2603.08011.
 - M. Gochoo et al. *FishEye8K: A Benchmark and Dataset for Fisheye Camera Object Detection.* CVPR Workshops 2023. arXiv:2305.17449.
 - Sources of the TickTockVQA images used here, all CC BY 4.0:
